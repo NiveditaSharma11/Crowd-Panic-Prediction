@@ -39,17 +39,22 @@ def load_model():
         print(f"Could not load any model: {e}")
         return None, {}
 
-model, MODEL_NAMES = load_model()
+model = None
+MODEL_NAMES = {}
+COUNT_CLASSES = [0]
 
-# Determine which class indices to count as "people"
-# best.pt: 0=head, 1=person  → use BOTH for maximum detection
-# yolov8s: 0=person          → use person (0)
-if model and 'head' in MODEL_NAMES.values():
-    COUNT_CLASSES = [0, 1]   # use both head AND person for best coverage
-    print("Using HEAD + PERSON detections for crowd counting")
-else:
-    COUNT_CLASSES = [0]
-    print("Using PERSON detections for crowd counting")
+def ensure_model_loaded():
+    global model, MODEL_NAMES, COUNT_CLASSES
+
+    if model is None:
+        model, MODEL_NAMES = load_model()
+
+        if model and 'head' in MODEL_NAMES.values():
+            COUNT_CLASSES = [0, 1]
+            print("Using HEAD + PERSON detections for crowd counting")
+        else:
+            COUNT_CLASSES = [0]
+            print("Using PERSON detections for crowd counting")
 
 
 # ════════════════════════════════════════════════════════
@@ -250,6 +255,7 @@ def compute_panic_score(baseline, speed, chaos, conflict, density_var, count):
 # Asynchronous Frame Generator
 # ════════════════════════════════════════════════════════
 async def generate_frames(input_path):
+    ensure_model_loaded()
     is_live = input_path.startswith("rtsp://") or \
               input_path.startswith("http://") or \
               input_path.startswith("https://")
