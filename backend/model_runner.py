@@ -1,0 +1,387 @@
+import cv2
+import numpy as np
+import os
+import base64
+from ultralytics import YOLO
+from collections import deque
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import torch
+
+_executor = ThreadPoolExecutor(max_workers=2)
+DEVICE = "0" if torch.cuda.is_available() else "cpu"
+
+# ── Paths ──
+BASE        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# best.pt is a crowd-specific model with 'head' (0) and 'person' (1) classes
+# Head detection is far superior in dense crowds where bodies are occluded
+BEST_MODEL  = os.path.join(BASE, "best.pt")
+FALLBACK    = os.path.join(BACKEND_DIR, "yolov8s.pt")
+
+def load_model():
+    for path, label in [(BEST_MODEL, "best.pt (crowd-specific)"), (FALLBACK, "yolov8s.pt (fallback)")]:
+        if os.path.exists(path):
+            try:
+                print(f"Loading {label}...")
+                m = YOLO(path)
+                print(f"Loaded {label} — classes: {m.names}")
+                return m, m.names
+            except Exception as e:
+                print(f"Failed to load {path}: {e}")
+    # last resort: download yolov8s
+    try:
+        print("Downloading yolov8s.pt...")
+        m = YOLO("yolov8s.pt")
+        return m, m.names
+    except Exception as e:
+        print(f"Could not load any model: {e}")
+        return None, {}
+
+model, MODEL_NAMES = load_model()
+
+# Determine which class indices to count as "people"
+# best.pt: 0=head, 1=person  → use BOTH for maximum detection
+# yolov8s: 0=person          → use person (0)
+if model and 'head' in MODEL_NAMES.values():
+    COUNT_CLASSES = [0, 1]   # use both head AND person for best coverage
+    print("Using HEAD + PERSON detections for crowd counting")
+else:
+    COUNT_CLASSES = [0]
+    print("Using PERSON detections for crowd counting")
+
+
+# ════════════════════════════════════════════════════════
+# SAHI-style Tiled Inference
+# Slices frame into overlapping tiles, runs YOLO on each,
+# merges results with proper NMS to eliminate duplicates.
+# ════════════════════════════════════════════════════════
+def tiled_detect(mdl, frame, tile_size=512, overlap=0.4, conf=0.08, iou=0.25):
+    """
+    SAHI-style tiled inference.
+    Smaller tiles (512) + more overlap (40%) = much better small/dense person detection.
+    Returns list of (x1, y1, x2, y2, score) in full-frame coords.
+    """
+    fh, fw = frame.shape[:2]
+    stride = int(tile_size * (1 - overlap))
+
+    all_boxes  = []
+    all_scores = []
+
+    # Generate tile grid
+    ys = list(range(0, max(1, fh - tile_size + 1), stride)) or [0]
+    xs = list(range(0, max(1, fw - tile_size + 1), stride)) or [0]
+    if ys[-1] + tile_size < fh:
+        ys.append(max(0, fh - tile_size))
+    if xs[-1] + tile_size < fw:
+        xs.append(max(0, fw - tile_size))
+
+    for y in ys:
+        for x in xs:
+            y2 = min(y + tile_size, fh)
+            x2 = min(x + tile_size, fw)
+            tile = frame[y:y2, x:x2]
+            if tile.size == 0:
+                continue
+
+            result = mdl.predict(
+                tile,
+                conf=conf,
+                iou=iou,
+                max_det=300,
+                imgsz=tile_size,
+                verbose=False,
+                device=DEVICE,
+                classes=COUNT_CLASSES,  # heads for best.pt, persons for generic
+                agnostic_nms=True,
+                augment=True,
+            )[0]
+
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+
+            boxes  = result.boxes.xyxy.cpu().numpy()
+            scores = result.boxes.conf.cpu().numpy()
+
+            for i, box in enumerate(boxes):
+                all_boxes.append([box[0]+x, box[1]+y, box[2]+x, box[3]+y])
+                all_scores.append(float(scores[i]))
+
+    if not all_boxes:
+        return []
+
+    # Merge with NMS across all tiles
+    boxes_np  = np.array(all_boxes,  dtype=np.float32)
+    scores_np = np.array(all_scores, dtype=np.float32)
+
+    widths  = boxes_np[:,2] - boxes_np[:,0]
+    heights = boxes_np[:,3] - boxes_np[:,1]
+    rects   = np.stack([boxes_np[:,0], boxes_np[:,1], widths, heights], axis=1).tolist()
+
+    indices = cv2.dnn.NMSBoxes(rects, scores_np.tolist(), score_threshold=conf, nms_threshold=0.35)
+    if len(indices) == 0:
+        return []
+
+    indices = indices.flatten()
+    return [(boxes_np[i][0], boxes_np[i][1], boxes_np[i][2], boxes_np[i][3], scores_np[i]) for i in indices]
+
+
+
+# ════════════════════════════════════════════════════════
+# Adaptive baseline
+# ════════════════════════════════════════════════════════
+class AdaptiveBaseline:
+    def __init__(self, warmup_frames=60, window=90):
+        self.warmup = warmup_frames
+        self.window = window
+        self.speeds = deque(maxlen=window)
+        self.chaos = deque(maxlen=window)
+        self.densities = deque(maxlen=window)
+        self.counts = deque(maxlen=window)
+        self.frame_n = 0
+
+    def update(self, speed, chaos, density, count):
+        self.frame_n += 1
+        self.speeds.append(speed)
+        self.chaos.append(chaos)
+        self.densities.append(density)
+        self.counts.append(count)
+
+    def is_warmed_up(self):
+        return self.frame_n >= self.warmup
+
+    def baseline(self, arr):
+        a = np.array(arr)
+        return float(np.mean(a)), float(np.std(a) + 1e-6)
+
+    def z_score(self, value, arr):
+        mean, std = self.baseline(arr)
+        return max(0.0, (value - mean) / std)
+
+
+# ════════════════════════════════════════════════════════
+# Optical Flow
+# ════════════════════════════════════════════════════════
+def get_optical_flow(prev_gray, gray):
+    if prev_gray is None:
+        return 0.0, 0.0, 0.0, False, None
+
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+    flow_x_std = float(np.std(flow[..., 0]))
+    flow_y_std = float(np.std(flow[..., 1]))
+    speed = float(np.mean(magnitude))
+
+    is_cam = (flow_x_std < 1.5 and flow_y_std < 1.5 and speed > 3.0)
+    if is_cam:
+        return 0.0, 0.0, 0.0, True, flow
+
+    chaos = float(np.var(angle))
+    angles_flat = angle.flatten()
+    sin_mean = np.mean(np.sin(angles_flat))
+    cos_mean = np.mean(np.cos(angles_flat))
+    direction_conflict = 1.0 - np.sqrt(sin_mean**2 + cos_mean**2)
+
+    return speed, chaos, direction_conflict, False, flow
+
+
+# ════════════════════════════════════════════════════════
+# Density
+# ════════════════════════════════════════════════════════
+def get_density_features(detected_boxes, frame_w, frame_h):
+    grid_counts = []
+    for row in range(3):
+        for col in range(3):
+            x1 = col * frame_w // 3
+            y1 = row * frame_h // 3
+            x2 = (col + 1) * frame_w // 3
+            y2 = (row + 1) * frame_h // 3
+            zone = 0
+            for bx1, by1, bx2, by2, *_ in detected_boxes:
+                cx = (bx1 + bx2) / 2
+                cy = (by1 + by2) / 2
+                if x1 < cx < x2 and y1 < cy < y2:
+                    zone += 1
+            grid_counts.append(zone)
+
+    if not grid_counts:
+        return 0, 0.0
+    return max(grid_counts), float(np.var(grid_counts))
+
+
+# ════════════════════════════════════════════════════════
+# Panic Score
+# ════════════════════════════════════════════════════════
+def compute_panic_score(baseline, speed, chaos, conflict, density_var, count):
+    if not baseline.is_warmed_up():
+        return 0
+    if count < 10:
+        return 0
+    if speed < 0.8:
+        return 0
+
+    z_speed   = max(0.0, baseline.z_score(speed, baseline.speeds) - 1.0)
+    z_chaos   = max(0.0, baseline.z_score(chaos, baseline.chaos) - 1.0)
+    z_density = max(0.0, baseline.z_score(density_var, baseline.densities) - 1.0)
+    z_conflict = conflict * 2.0
+
+    raw_score = (
+        z_speed   * 0.25 +
+        z_chaos   * 0.30 +
+        z_conflict * 0.25 +
+        z_density * 0.20
+    )
+
+    if not hasattr(baseline, "panic_history"):
+        baseline.panic_history = deque(maxlen=12)
+
+    baseline.panic_history.append(raw_score > 1.2)
+    if sum(baseline.panic_history) < 5:
+        raw_score *= 0.3
+
+    return min(100, int((raw_score / 4.0) * 100))
+
+
+# ════════════════════════════════════════════════════════
+# Asynchronous Frame Generator
+# ════════════════════════════════════════════════════════
+async def generate_frames(input_path):
+    is_live = input_path.startswith("rtsp://") or \
+              input_path.startswith("http://") or \
+              input_path.startswith("https://")
+
+    cap = cv2.VideoCapture(input_path)
+    if is_live:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if not cap.isOpened() or w == 0 or h == 0:
+        yield None, None, {"error": "Could not open video/stream"}
+        return
+
+    prev_gray    = None
+    baseline     = AdaptiveBaseline()
+    risk_buffer  = deque(maxlen=8)
+    count_buffer = deque(maxlen=5)
+    frame_count  = 0
+    last_detected = []
+    # For live: run detection every 2nd frame, reuse last result for skipped frames
+    # This doubles FPS while keeping detection boxes always visible
+    INFER_EVERY   = 2 if is_live else 3
+    # For live: drain stale buffer frames before each read
+    DRAIN         = 2 if is_live else 0
+
+    while cap.isOpened():
+        # Drain stale buffer frames for live streams
+        for _ in range(DRAIN):
+            cap.grab()
+
+        ret, frame = cap.read()
+        if not ret:
+            if is_live:
+                await asyncio.sleep(0.3)
+                continue
+            break
+
+        frame_count += 1
+        await asyncio.sleep(0)
+
+        # Resize — upscale small live frames for better detection
+        fh, fw = frame.shape[:2]
+        if is_live and fw < 1280:
+            # Upscale small streams so people appear larger to the model
+            scale = 1280 / fw
+            frame = cv2.resize(frame, (1280, int(fh * scale)), interpolation=cv2.INTER_LINEAR)
+            fh, fw = frame.shape[:2]
+        elif not is_live and fw > 1280:
+            scale = 1280 / fw
+            frame = cv2.resize(frame, (1280, int(fh * scale)))
+            fh, fw = frame.shape[:2]
+
+        # Optical flow
+        small = cv2.resize(frame, (640, 360))
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        speed, chaos, conflict, is_cam, flow = get_optical_flow(prev_gray, gray)
+        prev_gray = gray
+
+        # ── Detection every INFER_EVERY frames, reuse last result otherwise ──
+        if model and (frame_count % INFER_EVERY == 1):
+            loop = asyncio.get_event_loop()
+            conf   = 0.04 if is_live else 0.08  # very aggressive for live CCTV
+            tile_s = 384  if is_live else 512   # smaller tiles = more detections
+            last_detected = await loop.run_in_executor(
+                _executor,
+                lambda f=frame: tiled_detect(
+                    model, f,
+                    tile_size=tile_s,
+                    overlap=0.4,    # more overlap = catch people at tile edges
+                    conf=conf,
+                    iou=0.20        # lower IOU = less suppression of nearby people
+                )
+            )
+
+        detected  = last_detected
+        annotated = frame.copy()
+        count     = 0
+
+        for det in detected:
+            x1, y1, x2, y2, score = det
+            color = (0,255,0) if score > 0.5 else (0,255,255) if score > 0.3 else (255,255,0)
+            cv2.rectangle(annotated, (int(x1),int(y1)), (int(x2),int(y2)), color, 2)
+            count += 1
+
+        count_buffer.append(count)
+        count = int(np.mean(count_buffer))
+
+        fh2, fw2    = annotated.shape[:2]
+        frame_area  = (fw2 * fh2) / 10000.0
+        density     = round(count / frame_area, 2) if frame_area > 0 else 0.0
+        density_label = ("Low" if density < 0.5 else
+                         "Moderate" if density < 1.5 else
+                         "High" if density < 3.0 else "Critical")
+
+        max_density, density_var = get_density_features(detected, fw2, fh2)
+        if not is_cam:
+            baseline.update(speed, chaos, density_var, count)
+
+        panic_score = compute_panic_score(baseline, speed, chaos, conflict, density_var, count)
+        if density > 3.0:   panic_score = min(100, panic_score + 30)
+        elif density > 1.5: panic_score = min(100, panic_score + 10)
+        panic_score = min(100, panic_score)
+        risk_buffer.append(panic_score)
+        smoothed = int(np.mean(risk_buffer))
+
+        cv2.putText(annotated, f"Risk: {smoothed}%", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 4)
+
+        # Heatmap
+        if flow is not None:
+            magnitude, angle = cv2.cartToPolar(flow[...,0], flow[...,1])
+            hsv = np.zeros((*gray.shape, 3), dtype=np.uint8)
+            hsv[...,0] = angle * 180 / np.pi / 2
+            hsv[...,1] = 255
+            hsv[...,2] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)
+            heatmap     = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+            heatmap_bg  = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            heatmap_vis = cv2.addWeighted(heatmap_bg, 0.4, heatmap, 0.6, 0)
+        else:
+            heatmap_vis = np.zeros((*gray.shape, 3), dtype=np.uint8)
+
+        q = 55 if is_live else 70
+        _, buf_ann  = cv2.imencode('.jpg', annotated,   [cv2.IMWRITE_JPEG_QUALITY, q])
+        _, buf_heat = cv2.imencode('.jpg', heatmap_vis, [cv2.IMWRITE_JPEG_QUALITY, 50])
+
+        yield (base64.b64encode(buf_ann).decode(),
+               base64.b64encode(buf_heat).decode(),
+               {"danger_level": smoothed, "people_count": count,
+                "density": density, "density_label": density_label,
+                "speed_index": round(speed, 2), "frame": frame_count})
+
+    cap.release()
+    yield None, None, {"status": "finished"}
