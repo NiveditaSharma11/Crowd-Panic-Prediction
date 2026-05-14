@@ -386,16 +386,32 @@ async function handleFile(file) {
 
     const formData = new FormData();
     formData.append('file', file);
+
+    const API_BASE = "https://crowd-panic-prediction.onrender.com";
+
     try {
-        const res = await fetch('/api/upload', { method: 'POST', body: formData });
+        const res = await fetch(`${API_BASE}/api/upload`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!res.ok) {
+            throw new Error(`Server error: ${res.status}`);
+        }
+
         const result = await res.json();
+
         if (result.status === 'success') {
             currentFilename = result.filename;
             setStatus('ready', 'Ready — click Start Analysis');
             document.getElementById('startStreamBtn').disabled = false;
             addLog(`Loaded: ${file.name}`);
+        } else {
+            setStatus('offline', 'Upload failed');
         }
-    } catch {
+
+    } catch (err) {
+        console.error(err);
         setStatus('offline', 'Upload failed');
     }
 }
