@@ -6,10 +6,10 @@ import os
 import json
 import asyncio
 import traceback
-from model_runner import generate_frames
 from notifier import send_alert, reset_alert_state
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+import httpx
 
 app = FastAPI()
 
@@ -42,10 +42,6 @@ FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 os.makedirs(FRONTEND_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=False), name="static")
 
-@app.get("/api/health")
-async def health():
-    from model_runner import model
-    return {"status": "ok", "model_loaded": model is not None}
 
 @app.get("/{full_path:path}")
 async def get_index_fallback(full_path: str):
@@ -140,32 +136,40 @@ async def websocket_stream(websocket: WebSocket):
         print(f"[WS] Starting stream: {filename} {'(LIVE)' if is_live_stream else ''}")
         reset_alert_state()  # fresh cooldown for each new stream
 
-        async for ann_b64, heat_b64, stats in generate_frames(file_path):
-            try:
-                if ann_b64 and heat_b64:
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+
+                response = await client.post(
+                    "https://YOUR-WORKER-URL.onrender.com/process",
+                    json={"video_path": file_path}
+                )
+
+                data = response.json()
+
+                for item in data["frames"]:
+
                     payload = {
-                        "annotated": f"data:image/jpeg;base64,{ann_b64}",
-                        "heatmap": f"data:image/jpeg;base64,{heat_b64}",
-                        "stats": stats
+                        "annotated": f"data:image/jpeg;base64,{item['annotated']}",
+                        "heatmap": f"data:image/jpeg;base64,{item['heatmap']}",
+                        "stats": item["stats"]
                     }
-                    try:
-                        await asyncio.wait_for(websocket.send_json(payload), timeout=30.0)
-                        frame_count += 1
-                        # Fire Telegram alert if danger threshold crossed
-                        asyncio.create_task(send_alert(stats))
-                        if frame_count % 50 == 0:
-                            print(f"[WS] {frame_count} frames, people={stats.get('people_count', 0)}")
-                    except asyncio.TimeoutError:
-                        print(f"[WS] Send timeout at frame {frame_count}, skipping")
-                        continue
-                else:
-                    await websocket.send_json({"stats": stats})
-                    break
-            except Exception as frame_err:
-                print(f"[WS] Frame error at {frame_count}: {frame_err}")
-                traceback.print_exc()
-                await websocket.send_json({"stats": {"error": str(frame_err)}})
-                break
+
+                    await websocket.send_json(payload)
+
+                    frame_count += 1
+
+                    asyncio.create_task(send_alert(item["stats"]))
+
+        except Exception as e:
+            print(f"[WS] Worker error: {e}")
+            traceback.print_exc()
+
+            await websocket.send_json({
+                "stats": {
+                "error": str(e)
+            }
+        })
 
         print(f"[WS] Stream complete: {frame_count} frames")
         await websocket.close(code=1000)
