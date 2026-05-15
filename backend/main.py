@@ -141,7 +141,7 @@ async def websocket_stream(websocket: WebSocket):
             async with httpx.AsyncClient(timeout=None) as client:
 
                 response = await client.post(
-                    "https://YOUR-WORKER-URL.onrender.com/process",
+                    "https://crowd-panic-worker.onrender.com",
                     json={"video_path": file_path}
                 )
 
