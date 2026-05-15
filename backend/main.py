@@ -145,6 +145,9 @@ async def websocket_stream(websocket: WebSocket):
                     json={"video_path": file_path}
                 )
 
+                print("Worker status:", response.status_code)
+                print("Worker response:", response.text)
+
                 data = response.json()
 
                 for item in data["frames"]:
