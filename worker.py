@@ -36,4 +36,13 @@ async def process_video(req: VideoRequest):
     return {"frames": results}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=9000)
+    import os
+
+    port = int(os.environ.get("PORT", 10000))
+
+    uvicorn.run(
+        "worker:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False
+    )
