@@ -140,15 +140,27 @@ async def websocket_stream(websocket: WebSocket):
         try:
             async with httpx.AsyncClient(timeout=None) as client:
 
-                response = await client.post(
-                    "https://crowd-panic-worker.onrender.com",
-                    json={"video_path": file_path}
-                )
+                with open(file_path, "rb") as f:
+
+                    response = await client.post(
+                        "https://crowd-panic-worker.onrender.com/process",
+                        files={"file": (filename, f, "video/mp4")}
+                    )
 
                 print("Worker status:", response.status_code)
                 print("Worker response:", response.text)
 
                 data = response.json()
+
+                print("[Worker Response]", data)
+
+                if "frames" not in data:
+                    await websocket.send_json({
+                        "stats": {
+                            "error": f"Worker failed: {data}"
+                        }
+                    })
+                    return
 
                 for item in data["frames"]:
 

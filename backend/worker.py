@@ -1,11 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-
-from pydantic import BaseModel
 from model_runner import generate_frames
 import uvicorn
+import tempfile
+import shutil
+import os
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,30 +16,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class VideoRequest(BaseModel):
-    video_path: str
-
 @app.post("/process")
-async def process_video(req: VideoRequest):
+async def process_video(file: UploadFile = File(...)):
+
+    temp_dir = tempfile.mkdtemp()
+    temp_path = os.path.join(temp_dir, file.filename)
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     results = []
 
-    async for ann_b64, heat_b64, stats in generate_frames(req.video_path):
+    try:
+        async for ann_b64, heat_b64, stats in generate_frames(temp_path):
 
-        results.append({
-            "annotated": ann_b64,
-            "heatmap": heat_b64,
-            "stats": stats
-        })
+            results.append({
+                "annotated": ann_b64,
+                "heatmap": heat_b64,
+                "stats": stats
+            })
 
-        if len(results) >= 5:
-            break
+            if len(results) >= 5:
+                break
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        if os.path.exists(temp_dir):
+            os.rmdir(temp_dir)
 
     return {"frames": results}
 
-if __name__ == "__main__":
-    import os
+@app.get("/")
+async def root():
+    return {"status": "worker running"}
 
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
 
     uvicorn.run(
