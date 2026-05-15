@@ -63,7 +63,14 @@ def ensure_model_loaded():
 # merges results with proper NMS to eliminate duplicates.
 # ════════════════════════════════════════════════════════
 def tiled_detect(mdl, frame, conf=0.08, iou=0.25):
-    frame = cv2.resize(frame, (640, 640))
+    h, w = frame.shape[:2]
+
+    scale = 640 / max(h, w)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    frame = cv2.resize(frame, (new_w, new_h))
 
     result = mdl.predict(
         frame,
