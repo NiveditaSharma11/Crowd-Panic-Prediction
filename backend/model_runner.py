@@ -62,56 +62,30 @@ def ensure_model_loaded():
 # Slices frame into overlapping tiles, runs YOLO on each,
 # merges results with proper NMS to eliminate duplicates.
 # ════════════════════════════════════════════════════════
-def tiled_detect(mdl, frame, tile_size=512, overlap=0.4, conf=0.08, iou=0.25):
-    """
-    SAHI-style tiled inference.
-    Smaller tiles (512) + more overlap (40%) = much better small/dense person detection.
-    Returns list of (x1, y1, x2, y2, score) in full-frame coords.
-    """
-    fh, fw = frame.shape[:2]
-    stride = int(tile_size * (1 - overlap))
+def tiled_detect(mdl, frame, conf=0.08, iou=0.25):
+    frame = cv2.resize(frame, (640, 640))
 
-    all_boxes  = []
-    all_scores = []
+    result = mdl.predict(
+        frame,
+        conf=conf,
+        iou=iou,
+        max_det=300,
+        imgsz=640,
+        verbose=False,
+        device=DEVICE,
+        classes=COUNT_CLASSES
+    )[0]
 
-    # Generate tile grid
-    ys = list(range(0, max(1, fh - tile_size + 1), stride)) or [0]
-    xs = list(range(0, max(1, fw - tile_size + 1), stride)) or [0]
-    if ys[-1] + tile_size < fh:
-        ys.append(max(0, fh - tile_size))
-    if xs[-1] + tile_size < fw:
-        xs.append(max(0, fw - tile_size))
+    if result.boxes is None or len(result.boxes) == 0:
+        return []
 
-    for y in ys:
-        for x in xs:
-            y2 = min(y + tile_size, fh)
-            x2 = min(x + tile_size, fw)
-            tile = frame[y:y2, x:x2]
-            if tile.size == 0:
-                continue
+    boxes = result.boxes.xyxy.cpu().numpy()
+    scores = result.boxes.conf.cpu().numpy()
 
-            result = mdl.predict(
-                tile,
-                conf=conf,
-                iou=iou,
-                max_det=300,
-                imgsz=tile_size,
-                verbose=False,
-                device=DEVICE,
-                classes=COUNT_CLASSES,  # heads for best.pt, persons for generic
-                agnostic_nms=True,
-                augment=True,
-            )[0]
-
-            if result.boxes is None or len(result.boxes) == 0:
-                continue
-
-            boxes  = result.boxes.xyxy.cpu().numpy()
-            scores = result.boxes.conf.cpu().numpy()
-
-            for i, box in enumerate(boxes):
-                all_boxes.append([box[0]+x, box[1]+y, box[2]+x, box[3]+y])
-                all_scores.append(float(scores[i]))
+    return [
+        (box[0], box[1], box[2], box[3], float(scores[i]))
+        for i, box in enumerate(boxes)
+    ]
 
     if not all_boxes:
         return []
@@ -324,11 +298,10 @@ async def generate_frames(input_path):
             last_detected = await loop.run_in_executor(
                 _executor,
                 lambda f=frame: tiled_detect(
-                    model, f,
-                    tile_size=tile_s,
-                    overlap=0.4,    # more overlap = catch people at tile edges
+                    model,
+                    f,
                     conf=conf,
-                    iou=0.20        # lower IOU = less suppression of nearby people
+                    iou=0.25
                 )
             )
 
